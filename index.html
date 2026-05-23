@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Belt Dad</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: monospace; color: #fff; }
+  #ui { position: fixed; inset: 0; pointer-events: none; }
+  #crosshair { position: absolute; top: 50%; left: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px; background: #fff; border-radius: 50%; opacity: .7; }
+  #hint { position: absolute; bottom: 18%; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,.55); padding: 6px 10px; border-radius: 4px; font-size: 14px; opacity: 0; transition: opacity .15s; }
+  #inv { position: absolute; top: 12px; left: 12px; background: rgba(0,0,0,.5); padding: 8px 12px; border-radius: 4px; font-size: 13px; }
+  #status { position: absolute; top: 12px; right: 12px; background: rgba(0,0,0,.5); padding: 8px 12px; border-radius: 4px; font-size: 13px; text-align: right; }
+  #overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; background: rgba(0,0,0,.85); text-align: center; pointer-events: auto; }
+  #overlay h1 { margin: 0 0 12px; font-size: 32px; letter-spacing: 2px; }
+  #overlay p  { margin: 4px 0; font-size: 14px; max-width: 460px; line-height: 1.5; }
+  #overlay button { margin-top: 18px; padding: 10px 18px; background: #c44; color: #fff; border: 0; font-family: inherit; font-size: 15px; cursor: pointer; border-radius: 4px; }
+  #overlay.hidden { display: none; }
+  #vignette { position: absolute; inset: 0; box-shadow: inset 0 0 200px 60px rgba(0,0,0,.85); pointer-events: none; }
+  #damage { position: absolute; inset: 0; background: radial-gradient(circle, transparent 40%, rgba(180,0,0,.0) 70%); pointer-events: none; transition: background .2s; }
+  #damage.hit { background: radial-gradient(circle, transparent 30%, rgba(180,0,0,.55) 80%); }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="crosshair"></div>
+  <div id="inv">Inventory: <span id="invlist">(empty)</span></div>
+  <div id="status"><span id="statetxt">—</span></div>
+  <div id="hint"></div>
+  <div id="vignette"></div>
+  <div id="damage"></div>
+  <div id="overlay">
+    <h1>BELT DAD</h1>
+    <p>You're locked in the house. Dad is angry and looking for you with his belt.</p>
+    <p><b>Get out:</b> grab the WRENCH from dad's bedroom, then use it on the front door in the living room.</p>
+    <p>WASD move &nbsp; Mouse look &nbsp; Shift sneak &nbsp; Hold Space + A/D to peek left/right &nbsp; E interact &nbsp; C crouch/hide under bed</p>
+    <p>If dad sees you he'll chase. Hide under a bed or wait for him to use the bathroom.</p>
+    <div style="display:flex; gap:10px;">
+      <button class="diffbtn" data-diff="easy"   style="background:#4a8">Easy</button>
+      <button class="diffbtn" data-diff="normal" style="background:#c44">Normal</button>
+      <button class="diffbtn" data-diff="hard"   style="background:#722">Hard</button>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ---------- Scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a0e);
+scene.fog = new THREE.Fog(0x14141a, 10, 40);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 100);
+const STAND_H = 1.65, CROUCH_H = 0.55;
+const bodyPos = new THREE.Vector3(-7, STAND_H, -7);
+const peekOffset = new THREE.Vector3();
+camera.position.copy(bodyPos);
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- Lights ----------
+scene.add(new THREE.AmbientLight(0x6a6a78, 1.1));
+scene.add(new THREE.HemisphereLight(0xffd9b3, 0x2a1f17, 0.6));
+
+const ceilingLights = [];
+function addCeilingLight(x, z, color = 0xffd9a3, intensity = 2.4) {
+  const l = new THREE.PointLight(color, intensity, 16, 1.2);
+  l.position.set(x, 2.6, z);
+  l.castShadow = true;
+  l.shadow.mapSize.set(512, 512);
+  scene.add(l);
+  ceilingLights.push(l);
+}
+
+// ---------- House layout ----------
+// 2x2 grid of rooms, each 10x10. Centers at (±5, ±5). Outer extents ±10.
+// Layout (looking from above, +x right, +z down):
+//   (-x,-z) Kid bedroom    | (+x,-z) Dad bedroom
+//   (-x,+z) Living room    | (+x,+z) Bathroom
+// Doorways: between kid<->dad (along x=0 at z=-5), between kid<->living (z=0 at x=-5),
+//           between living<->bathroom (x=0 at z=+5), between dad<->bathroom (z=0 at x=+5).
+// Front door: south wall of living room (z=+10, x≈-5). Boarded window: west wall of living room (x=-10, z≈+5).
+
+const WALL_H = 3;
+const wallMat = new THREE.MeshStandardMaterial({ color: 0x6b5b48, roughness: 0.95 });
+const floorMat = new THREE.MeshStandardMaterial({ color: 0x2a1f17, roughness: 1 });
+const tileMat  = new THREE.MeshStandardMaterial({ color: 0x6a7a82, roughness: 0.6 });
+const woodMat  = new THREE.MeshStandardMaterial({ color: 0x4a3324, roughness: 0.9 });
+const bedMat   = new THREE.MeshStandardMaterial({ color: 0x3a4a6a, roughness: 0.9 });
+const sheetMat = new THREE.MeshStandardMaterial({ color: 0xb8b0a0, roughness: 1 });
+
+// Floor
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// Bathroom tile floor (overlay)
+const bath = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), tileMat);
+bath.rotation.x = -Math.PI / 2;
+bath.position.set(5, 0.01, 5);
+bath.receiveShadow = true;
+scene.add(bath);
+
+// Ceiling
+const ceil = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), wallMat);
+ceil.rotation.x = Math.PI / 2;
+ceil.position.y = WALL_H;
+scene.add(ceil);
+
+// Walls — list of {x,z,w,d} axis-aligned box centers. AABBs are used for collision.
+const walls = [];
+function wall(x, z, w, d, mat = wallMat) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, WALL_H, d), mat);
+  m.position.set(x, WALL_H / 2, z);
+  m.castShadow = true; m.receiveShadow = true;
+  scene.add(m);
+  walls.push({ minX: x - w/2, maxX: x + w/2, minZ: z - d/2, maxZ: z + d/2, mesh: m });
+}
+
+// Outer walls (each 20 long) with a gap on the south wall for the front door (and an alcove for window on west).
+// South wall: front door is at x in [-7, -3] (the door object sits in this gap).
+wall(-8.5, 10, 3, 0.3);   // south-west chunk
+wall(0, 10, 6, 0.3);      // south middle (between -3 and +3 -> wait we need gap at -7..-3 so middle is -3..+10? simpler: build pieces)
+// Reset: I want a clean gap for the door. Remove the previous south pieces by tracking and rebuilding.
+// (Easier: just build the south wall in clean segments below.)
+walls.length = 0;
+scene.children.filter(c => c.geometry && c.geometry.type === 'BoxGeometry' && c.position.y === WALL_H/2).forEach(c => scene.remove(c));
+
+// Outer walls
+// North
+wall(0, -10, 20, 0.3);
+// East (with door gap to outside? no, only south has a door)
+wall(10, 0, 0.3, 20);
+// West (solid)
+wall(-10, 0, 0.3, 20);
+// South (with front door gap at x in [-7, -3])
+wall(-8.5, 10, 3, 0.3);   // x -10..-7
+wall(3.5, 10, 13, 0.3);   // x -3..+10
+
+// Interior walls
+// Vertical mid wall (x=0) — two narrow 1-unit-wide doorways centered at z=-5 and z=+5
+wall(0, -7.75, 0.3, 4.5);   // z -10..-5.5
+wall(0, 0, 0.3, 9);          // z -4.5..+4.5
+wall(0, 7.75, 0.3, 4.5);    // z +5.5..+10
+
+// Horizontal mid wall (z=0) — two narrow 1-unit-wide doorways centered at x=-5 and x=+5
+wall(-7.75, 0, 4.5, 0.3);   // x -10..-5.5
+wall(0, 0, 9, 0.3);          // x -4.5..+4.5
+wall(7.75, 0, 4.5, 0.3);    // x +5.5..+10
+
+// Front door (closed; opens when used with wrench)
+const doorGroup = new THREE.Group();
+const doorMesh = new THREE.Mesh(new THREE.BoxGeometry(4, 2.6, 0.15), new THREE.MeshStandardMaterial({ color: 0x5a3a1f, roughness: 0.9 }));
+doorMesh.position.set(-5, 1.3, 10);
+doorMesh.castShadow = true;
+scene.add(doorMesh);
+const doorAABB = { minX: -7, maxX: -3, minZ: 9.85, maxZ: 10.15, mesh: doorMesh, isDoor: true, open: false };
+walls.push(doorAABB);
+
+// ---------- Room contents ----------
+// Helper: bed (also acts as a hide spot when crouching nearby)
+const hideSpots = []; // {x,z,radius}
+function bed(x, z, rot = 0) {
+  const g = new THREE.Group();
+  const frame = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.35, 1.2), woodMat);
+  frame.position.y = 0.2; frame.castShadow = true; frame.receiveShadow = true;
+  const mattress = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.25, 1.0), sheetMat);
+  mattress.position.y = 0.5; mattress.castShadow = true;
+  const pillow = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.12, 0.7), sheetMat);
+  pillow.position.set(-0.7, 0.7, 0); pillow.castShadow = true;
+  g.add(frame, mattress, pillow);
+  g.position.set(x, 0, z);
+  g.rotation.y = rot;
+  scene.add(g);
+  // collision (so you can't walk through bed unless crouched-under)
+  walls.push({ minX: x - 1.1, maxX: x + 1.1, minZ: z - 0.6, maxZ: z + 0.6, mesh: frame, isBed: true });
+  hideSpots.push({ x, z, r: 1.6 });
+  return g;
+}
+
+// Kid bedroom (NW: x≈-5, z≈-5) — bed pushed against north wall so spawn at (-7,-7) is clear
+bed(-7, -8.8);
+// Dresser in kid room (decor) — against west wall
+{
+  const d = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.1, 1.6), woodMat);
+  d.position.set(-9.4, 0.55, -3); d.castShadow = true; scene.add(d);
+  walls.push({ minX: -9.7, maxX: -9.1, minZ: -3.8, maxZ: -2.2, mesh: d });
+}
+
+// Dad bedroom (NE: x≈+5, z≈-5)
+bed(7, -8.8);
+// Dresser holding wrench — against east wall
+{
+  const d = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.1, 1.6), woodMat);
+  d.position.set(9.4, 0.55, -3); d.castShadow = true; scene.add(d);
+  walls.push({ minX: 9.1, maxX: 9.7, minZ: -3.8, maxZ: -2.2, mesh: d });
+}
+
+// Bathroom (SE: x≈+5, z≈+5)
+// Toilet
+{
+  const base = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 0.8), new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.5 }));
+  base.position.set(8.5, 0.25, 8.5); base.castShadow = true; scene.add(base);
+  const tank = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.7, 0.3), new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.5 }));
+  tank.position.set(8.5, 0.85, 8.85); tank.castShadow = true; scene.add(tank);
+  walls.push({ minX: 8.15, maxX: 8.85, minZ: 8.1, maxZ: 9.0, mesh: base });
+}
+// Sink
+{
+  const s = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.9, 0.6), new THREE.MeshStandardMaterial({ color: 0xdddddd }));
+  s.position.set(3, 0.45, 8.7); s.castShadow = true; scene.add(s);
+  walls.push({ minX: 2.4, maxX: 3.6, minZ: 8.4, maxZ: 9, mesh: s });
+}
+
+// Living room (SW: x≈-5, z≈+5)
+// Couch
+{
+  const c = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.8, 0.9), new THREE.MeshStandardMaterial({ color: 0x4a3320, roughness: 1 }));
+  c.position.set(-8, 0.4, 2); c.castShadow = true; scene.add(c);
+  walls.push({ minX: -9.2, maxX: -6.8, minZ: 1.55, maxZ: 2.45, mesh: c });
+}
+
+// ---------- Items ----------
+const items = []; // {mesh, kind: 'wrench'|'hammer', x, z}
+function makeWrench(x, z) {
+  const g = new THREE.Group();
+  const shaft = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.07, 0.07), new THREE.MeshStandardMaterial({ color: 0xc0c0c8, metalness: 0.7, roughness: 0.4 }));
+  const head  = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, 0.06), new THREE.MeshStandardMaterial({ color: 0xc0c0c8, metalness: 0.7, roughness: 0.4 }));
+  head.position.set(0.3, 0, 0);
+  g.add(shaft, head);
+  g.position.set(x, 1.18, z);
+  scene.add(g);
+  items.push({ mesh: g, kind: 'wrench' });
+  return g;
+}
+makeWrench(9.25, -3);  // on dad's dresser (east wall)
+
+// ---------- Dad NPC ----------
+const dad = new THREE.Group();
+{
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.7, 1.4, 0.45), new THREE.MeshStandardMaterial({ color: 0x553322 }));
+  body.position.y = 0.7; body.castShadow = true;
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.45, 0.45), new THREE.MeshStandardMaterial({ color: 0xd6a380 }));
+  head.position.y = 1.65; head.castShadow = true;
+  const belt = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.05, 0.7), new THREE.MeshStandardMaterial({ color: 0x111111 }));
+  belt.position.set(0.45, 0.9, 0); belt.castShadow = true;
+  dad.add(body, head, belt);
+}
+dad.position.set(7, 0, -7); // starts in his bedroom
+scene.add(dad);
+const dadLight = new THREE.SpotLight(0xffe0b0, 1.2, 7, Math.PI/5, 0.5, 1.5);
+dadLight.position.set(0, 1.6, 0);
+dadLight.target.position.set(0, 1.4, 2);
+dad.add(dadLight);
+dad.add(dadLight.target);
+
+// Room centers (for patrol)
+const PATROL = [
+  { name: 'kid',     x: -5, z: -5 },
+  { name: 'dad',     x:  5, z: -5 },
+  { name: 'living',  x: -5, z:  5 },
+  { name: 'bath',    x:  5, z:  5 },
+];
+function roomAt(x, z) {
+  return (x < 0 ? (z < 0 ? 'kid' : 'living') : (z < 0 ? 'dad' : 'bath'));
+}
+
+// Ceiling lights per room
+addCeilingLight(-5, -5);
+addCeilingLight( 5, -5);
+addCeilingLight(-5,  5, 0xffe6c2, 2.2);
+addCeilingLight( 5,  5, 0xbfd9ff, 2.6);
+
+// ---------- Player state ----------
+const player = {
+  vx: 0, vz: 0,
+  yaw: Math.PI * 1.25,    // facing into the house (toward +x,+z from spawn at -7,-7)
+  pitch: 0,
+  crouch: false,
+  hiding: false,
+  health: 3,
+  inv: new Set(),
+  dead: false,
+  won: false,
+  invuln: 0,
+};
+
+camera.rotation.order = 'YXZ';
+
+// ---------- Audio (footsteps) ----------
+let audio = null;
+let noiseBuffer = null;
+function initAudio() {
+  if (audio) return;
+  audio = new (window.AudioContext || window.webkitAudioContext)();
+  // ~0.25s of white noise — reused for every footstep tick
+  const len = Math.floor(audio.sampleRate * 0.25);
+  noiseBuffer = audio.createBuffer(1, len, audio.sampleRate);
+  const data = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+}
+function playAlert() {
+  if (!audio) return;
+  const now = audio.currentTime;
+  // Harsh descending tone — dad shouts when he spots you
+  const osc = audio.createOscillator();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(750, now);
+  osc.frequency.exponentialRampToValueAtTime(280, now + 0.45);
+  const osc2 = audio.createOscillator();
+  osc2.type = 'square';
+  osc2.frequency.setValueAtTime(380, now);
+  osc2.frequency.exponentialRampToValueAtTime(140, now + 0.45);
+  const gain = audio.createGain();
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(0.35, now + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
+  osc.connect(gain); osc2.connect(gain);
+  gain.connect(audio.destination);
+  osc.start(now); osc2.start(now);
+  osc.stop(now + 0.6); osc2.stop(now + 0.6);
+}
+
+function playStep({ volume = 0.25, pitch = 1.0 } = {}) {
+  if (!audio) return;
+  const src = audio.createBufferSource();
+  src.buffer = noiseBuffer;
+  src.playbackRate.value = pitch;
+  // Low-pass filter to make noise sound like a thud on wood/carpet
+  const filter = audio.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 600 * pitch;
+  filter.Q.value = 1.2;
+  // Quick attack/decay envelope
+  const gain = audio.createGain();
+  const now = audio.currentTime;
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(volume, now + 0.008);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+  src.connect(filter).connect(gain).connect(audio.destination);
+  src.start(now);
+  src.stop(now + 0.2);
+}
+
+// Track distance traveled per actor; emit a footstep each STEP_DIST units.
+const STEP_DIST = 1.2;
+const stepAccum = { player: 0, dad: 0 };
+const lastPos = {
+  player: new THREE.Vector3(),
+  dad: new THREE.Vector3(),
+};
+
+// ---------- Input ----------
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyE') tryInteract();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+document.body.addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  player.yaw -= e.movementX * 0.0022;
+  player.pitch -= e.movementY * 0.0022;
+  player.pitch = Math.max(-1.2, Math.min(1.2, player.pitch));
+});
+
+const overlay = document.getElementById('overlay');
+
+const DIFFICULTIES = {
+  easy:   { player: { walk: 2.8, sneak: 1.2,  crouch: 1.3 },  dad: { chase: 1.3, search: 0.85, patrol: 0.6 }, sight: { range:  9, dotMin: 0.93 } },
+  normal: { player: { walk: 2.4, sneak: 1.0,  crouch: 1.1 },  dad: { chase: 1.7, search: 1.10, patrol: 0.8 }, sight: { range: 12, dotMin: 0.866 } },
+  hard:   { player: { walk: 2.0, sneak: 0.85, crouch: 0.95 }, dad: { chase: 2.2, search: 1.50, patrol: 1.1 }, sight: { range: 15, dotMin: 0.77 } },
+};
+let diff = DIFFICULTIES.normal;
+
+document.querySelectorAll('.diffbtn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    diff = DIFFICULTIES[btn.dataset.diff];
+    initAudio();
+    overlay.classList.add('hidden');
+    renderer.domElement.requestPointerLock();
+    lastPos.player.copy(bodyPos);
+    lastPos.dad.copy(dad.position);
+  });
+});
+renderer.domElement.addEventListener('click', () => {
+  if (!player.dead && !player.won) renderer.domElement.requestPointerLock();
+});
+
+// ---------- Collision ----------
+function collides(x, z, r = 0.28) {
+  for (const w of walls) {
+    if (w.isDoor && w.open) continue;
+    if (w.isBed && player.hiding && Math.hypot(x - (w.minX+w.maxX)/2, z - (w.minZ+w.maxZ)/2) < 1.6) continue;
+    if (x + r > w.minX && x - r < w.maxX && z + r > w.minZ && z - r < w.maxZ) return true;
+  }
+  return false;
+}
+
+// ---------- Interaction ----------
+const hint = document.getElementById('hint');
+let activePrompt = null;
+
+function nearestInteract() {
+  const p = bodyPos;
+  // Items
+  for (const it of items) {
+    const d = Math.hypot(p.x - it.mesh.position.x, p.z - it.mesh.position.z);
+    if (d < 1.3) return { kind: 'item', it, label: `[E] Pick up ${it.kind}` };
+  }
+  // Door
+  if (!doorAABB.open) {
+    const dx = p.x - (-5), dz = p.z - 10;
+    if (Math.abs(dx) < 2.5 && Math.abs(dz) < 1.5) {
+      if (player.inv.has('wrench')) return { kind: 'door', label: '[E] Open door with wrench' };
+      return { kind: 'door-locked', label: 'Door is locked. Find the wrench.' };
+    }
+  }
+// Bed hide
+  for (const h of hideSpots) {
+    if (Math.hypot(p.x - h.x, p.z - h.z) < 1.6) {
+      return { kind: 'bed', spot: h, label: player.hiding ? '[C] Come out' : '[C] Hide under bed' };
+    }
+  }
+  return null;
+}
+
+function tryInteract() {
+  if (!activePrompt) return;
+  if (activePrompt.kind === 'item') {
+    player.inv.add(activePrompt.it.kind);
+    scene.remove(activePrompt.it.mesh);
+    items.splice(items.indexOf(activePrompt.it), 1);
+    updateInv();
+  } else if (activePrompt.kind === 'door') {
+    doorAABB.open = true;
+    // Swing door visually
+    doorMesh.position.x = -3.2;
+    doorMesh.position.z = 11.2;
+    doorMesh.rotation.y = -Math.PI / 2.2;
+  }
+}
+
+function updateInv() {
+  const list = [...player.inv].join(', ') || '(empty)';
+  document.getElementById('invlist').textContent = list;
+}
+
+// ---------- Dad AI ----------
+const dadState = {
+  mode: 'patrol',     // patrol | toBathroom | inBathroom | chase | search
+  target: null,
+  patrolIdx: 0,
+  bathroomTimer: 0,
+  nextBathroomCheck: 20 + Math.random() * 15,   // no early bathroom break
+  searchTimer: 0,
+  lastSeenX: 0, lastSeenZ: 0,
+  speed: 1.1,
+  hitCooldown: 0,
+};
+
+function pickPatrolTarget() {
+  // Pick a random room (biased away from current) then a random point inside it.
+  let idx;
+  do { idx = Math.floor(Math.random() * PATROL.length); } while (PATROL[idx].name === dadState.lastRoom && Math.random() < 0.7);
+  dadState.lastRoom = PATROL[idx].name;
+  const room = PATROL[idx];
+  // Random point in the 10x10 room, kept ~1.5u away from walls so dad doesn't pathfind into a corner
+  const x = room.x + (Math.random() - 0.5) * 7;
+  const z = room.z + (Math.random() - 0.5) * 7;
+  return { x, z, room: room.name };
+}
+
+dadState.target = pickPatrolTarget();
+
+function canDadSeePlayer() {
+  // Narrow forward cone — ~60° FOV (30° half-angle), so peeking and being behind dad both work.
+  const dx = camera.position.x - dad.position.x;
+  const dz = camera.position.z - dad.position.z;
+  const dist = Math.hypot(dx, dz);
+  if (dist > diff.sight.range) return false;
+  const fx = Math.sin(dad.rotation.y), fz = Math.cos(dad.rotation.y);
+  const dot = (dx * fx + dz * fz) / (dist || 1);
+  if (dot < diff.sight.dotMin) return false;
+  // Wall LOS check via simple ray-AABB sampling
+  const steps = Math.ceil(dist * 4);
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const x = dad.position.x + dx * t;
+    const z = dad.position.z + dz * t;
+    for (const w of walls) {
+      if (w.isDoor && w.open) continue;
+      if (w.isBed) continue;
+      if (x > w.minX && x < w.maxX && z > w.minZ && z < w.maxZ) return false;
+    }
+  }
+  // If player is hiding under bed AND not moving fast, dad doesn't see
+  if (player.hiding) return false;
+  // Sneaking + far: harder to see
+  if (keys['ShiftLeft'] && dist > 4) return Math.random() < 0.02;
+  return true;
+}
+
+function dadStep(dt) {
+  // Decide bathroom break
+  dadState.nextBathroomCheck -= dt;
+  if (dadState.mode === 'patrol' && dadState.nextBathroomCheck <= 0) {
+    if (Math.random() < 0.6) {
+      dadState.mode = 'toBathroom';
+      dadState.target = { x: 5, z: 5, room: 'bath' };
+    }
+    dadState.nextBathroomCheck = 15 + Math.random() * 15;
+  }
+
+  // Sight
+  if (dadState.mode !== 'inBathroom' && canDadSeePlayer()) {
+    if (dadState.mode !== 'chase') playAlert();   // shout on initial spot
+    dadState.mode = 'chase';
+    dadState.lastSeenX = camera.position.x;
+    dadState.lastSeenZ = camera.position.z;
+  }
+
+  // Pick target depending on mode
+  let tx, tz;
+  if (dadState.mode === 'chase') {
+    tx = camera.position.x; tz = camera.position.z;
+    dadState.lastSeenX = tx; dadState.lastSeenZ = tz;
+    if (!canDadSeePlayer()) {
+      // Lost sight → search
+      dadState.mode = 'search';
+      dadState.searchTimer = 6;
+    }
+  } else if (dadState.mode === 'search') {
+    tx = dadState.lastSeenX; tz = dadState.lastSeenZ;
+    dadState.searchTimer -= dt;
+    if (dadState.searchTimer <= 0 || (Math.hypot(dad.position.x - tx, dad.position.z - tz) < 0.6)) {
+      dadState.mode = 'patrol';
+      dadState.target = pickPatrolTarget();
+    }
+  } else if (dadState.mode === 'inBathroom') {
+    dadState.bathroomTimer -= dt;
+    tx = dad.position.x; tz = dad.position.z;
+    if (dadState.bathroomTimer <= 0) {
+      dadState.mode = 'patrol';
+      dadState.target = pickPatrolTarget();
+    }
+  } else { // patrol or toBathroom
+    tx = dadState.target.x; tz = dadState.target.z;
+    if (Math.hypot(dad.position.x - tx, dad.position.z - tz) < 0.6) {
+      if (dadState.mode === 'toBathroom') {
+        dadState.mode = 'inBathroom';
+        dadState.bathroomTimer = 8 + Math.random() * 6;
+      } else {
+        // Pause briefly at each patrol point to "look around" before picking a new target
+        if (!dadState.pauseTimer || dadState.pauseTimer <= 0) {
+          dadState.pauseTimer = 0.8 + Math.random() * 1.6;
+        }
+        dadState.pauseTimer -= dt;
+        if (dadState.pauseTimer <= 0) {
+          dadState.target = pickPatrolTarget();
+        }
+      }
+    }
+  }
+
+  // Move toward target with naive doorway navigation: head toward room-mid before crossing.
+  if (dadState.mode !== 'inBathroom') {
+    const speed = (dadState.mode === 'chase' ? diff.dad.chase : (dadState.mode === 'search' ? diff.dad.search : diff.dad.patrol));
+    // Pick a "waypoint": if dad and target are in different quadrants, route via origin (which is always intersection of doorways)
+    let wx = tx, wz = tz;
+    const sameQuadX = (dad.position.x < 0) === (tx < 0);
+    const sameQuadZ = (dad.position.z < 0) === (tz < 0);
+    if (!sameQuadX && !sameQuadZ) {
+      // need to cross both walls — head to nearest doorway midpoint first.
+      // Use horizontal doorway near current Z if closer, else vertical.
+      // Doorway midpoints: (0, -5), (0, +5), (-5, 0), (+5, 0)
+      const dws = [{x:0,z:-5},{x:0,z:5},{x:-5,z:0},{x:5,z:0}];
+      let best = dws[0], bd = Infinity;
+      for (const d of dws) {
+        const dd = Math.hypot(dad.position.x - d.x, dad.position.z - d.z) + Math.hypot(d.x - tx, d.z - tz);
+        if (dd < bd) { bd = dd; best = d; }
+      }
+      wx = best.x; wz = best.z;
+    } else if (!sameQuadX) {
+      // cross vertical mid wall: aim at doorway on z=-5 or z=+5
+      wx = 0;
+      wz = (Math.abs(dad.position.z - (-5)) < Math.abs(dad.position.z - 5)) ? -5 : 5;
+    } else if (!sameQuadZ) {
+      wz = 0;
+      wx = (Math.abs(dad.position.x - (-5)) < Math.abs(dad.position.x - 5)) ? -5 : 5;
+    }
+
+    // If close enough to waypoint, aim at real target
+    if (Math.hypot(dad.position.x - wx, dad.position.z - wz) < 0.8) {
+      wx = tx; wz = tz;
+    }
+
+    const dx = wx - dad.position.x;
+    const dz = wz - dad.position.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist > 0.05) {
+      const nx = dx / dist, nz = dz / dist;
+      const step = speed * dt;
+      let newX = dad.position.x + nx * step;
+      let newZ = dad.position.z + nz * step;
+      // Soft collision: try axes separately
+      if (!dadCollides(newX, dad.position.z)) dad.position.x = newX;
+      if (!dadCollides(dad.position.x, newZ)) dad.position.z = newZ;
+      // Face direction of motion
+      dad.rotation.y = Math.atan2(nx, nz);
+    }
+  }
+
+  // Attack
+  dadState.hitCooldown -= dt;
+  const distToP = Math.hypot(dad.position.x - bodyPos.x, dad.position.z - bodyPos.z);
+  if (distToP < 1.1 && !player.hiding && dadState.hitCooldown <= 0 && !player.dead && !player.won) {
+    hitPlayer();
+    dadState.hitCooldown = 1.0;
+  }
+}
+
+function dadCollides(x, z) {
+  const r = 0.35;
+  for (const w of walls) {
+    if (w.isDoor && w.open) continue;
+    if (w.isBed) continue;
+    if (x + r > w.minX && x - r < w.maxX && z + r > w.minZ && z - r < w.maxZ) return true;
+  }
+  return false;
+}
+
+function hitPlayer() {
+  player.health -= 1;
+  const dmg = document.getElementById('damage');
+  dmg.classList.add('hit');
+  setTimeout(() => dmg.classList.remove('hit'), 200);
+  if (player.health <= 0) endGame(false);
+}
+
+function endGame(win) {
+  if (player.dead || player.won) return;
+  if (win) player.won = true; else player.dead = true;
+  document.exitPointerLock();
+  overlay.classList.remove('hidden');
+  overlay.innerHTML = win
+    ? `<h1>YOU ESCAPED</h1><p>You made it out. Dad is still yelling inside.</p><button onclick="location.reload()">Play again</button>`
+    : `<h1>CAUGHT</h1><p>Dad got you with the belt.</p><button onclick="location.reload()">Try again</button>`;
+}
+
+// ---------- Loop ----------
+let last = performance.now();
+function tick(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+
+  // Player movement
+  if (!player.dead && !player.won) {
+    const peeking = keys['Space'];
+    const sp = (player.hiding || peeking ? 0 : (keys['ShiftLeft'] ? diff.player.sneak : (player.crouch ? diff.player.crouch : diff.player.walk)));
+    let fx = 0, fz = 0;
+    if (keys['KeyW']) fz += 1;
+    if (keys['KeyS']) fz -= 1;
+    if (keys['KeyA']) fx -= 1;
+    if (keys['KeyD']) fx += 1;
+    const len = Math.hypot(fx, fz);
+    if (len > 0) { fx /= len; fz /= len; }
+    // local -> world based on yaw (camera forward = (-sin yaw, 0, -cos yaw), right = (cos yaw, 0, -sin yaw))
+    const cy = Math.cos(player.yaw), sy = Math.sin(player.yaw);
+    const wx =  fx * cy - fz * sy;
+    const wz = -fx * sy - fz * cy;
+    let nx = bodyPos.x + wx * sp * dt;
+    let nz = bodyPos.z + wz * sp * dt;
+    if (!collides(nx, bodyPos.z)) bodyPos.x = nx;
+    if (!collides(bodyPos.x, nz)) bodyPos.z = nz;
+
+    // Crouch toggle on C handled in keydown? Handle here as edge detection.
+    if (keys['KeyC'] && !player._cWas) {
+      const near = nearestInteract();
+      if (near && near.kind === 'bed') {
+        player.hiding = !player.hiding;
+        player.crouch = player.hiding;
+      } else {
+        player.crouch = !player.crouch;
+        if (!player.crouch) player.hiding = false;
+      }
+    }
+    player._cWas = keys['KeyC'];
+
+    const targetH = (player.crouch || player.hiding) ? CROUCH_H : STAND_H;
+    bodyPos.y += (targetH - bodyPos.y) * Math.min(1, dt * 10);
+
+    camera.rotation.y = player.yaw;
+    camera.rotation.x = player.pitch;
+
+    // Peek (Space + A/D): shift head sideways up to ~0.7u, clamped to walls. No movement while peeking.
+    peekOffset.set(0, 0, 0);
+    if (peeking) {
+      // right vector in world space = (cos yaw, 0, -sin yaw)
+      const cy = Math.cos(player.yaw), sy = Math.sin(player.yaw);
+      let dir = 0;
+      if (keys['KeyD']) dir += 1;
+      if (keys['KeyA']) dir -= 1;
+      if (dir !== 0) {
+        const rx = cy * dir, rz = -sy * dir;
+        for (let amt = 0.7; amt > 0.05; amt -= 0.1) {
+          const tx = bodyPos.x + rx * amt;
+          const tz = bodyPos.z + rz * amt;
+          if (!collides(tx, tz, 0.1)) { peekOffset.set(rx * amt, 0, rz * amt); break; }
+        }
+      }
+    }
+    camera.position.copy(bodyPos).add(peekOffset);
+
+    // Win check: are we outside the house through the front door? (uses body, not peeked head)
+    if (bodyPos.z > 10.4) endGame(true);
+
+    // Prompts
+    activePrompt = nearestInteract();
+    if (activePrompt) {
+      hint.textContent = activePrompt.label;
+      hint.style.opacity = 1;
+    } else {
+      hint.style.opacity = 0;
+    }
+
+    // Dad
+    dadStep(dt);
+
+    // Footsteps — emit each STEP_DIST units of horizontal movement.
+    if (audio) {
+      const pdx = bodyPos.x - lastPos.player.x;
+      const pdz = bodyPos.z - lastPos.player.z;
+      stepAccum.player += Math.hypot(pdx, pdz);
+      lastPos.player.copy(bodyPos);
+      if (stepAccum.player >= STEP_DIST) {
+        stepAccum.player = 0;
+        const sneaking = keys['ShiftLeft'] || player.crouch || player.hiding;
+        playStep({ volume: sneaking ? 0.08 : 0.28, pitch: 1.0 });
+      }
+
+      const ddx = dad.position.x - lastPos.dad.x;
+      const ddz = dad.position.z - lastPos.dad.z;
+      stepAccum.dad += Math.hypot(ddx, ddz);
+      lastPos.dad.copy(dad.position);
+      if (stepAccum.dad >= STEP_DIST) {
+        stepAccum.dad = 0;
+        // Dad footsteps: heavier (lower pitch), volume falls off with distance from player.
+        const distToP = Math.hypot(dad.position.x - bodyPos.x, dad.position.z - bodyPos.z);
+        const vol = Math.max(0.05, 0.55 - distToP * 0.04);
+        playStep({ volume: vol, pitch: 0.55 });
+      }
+    }
+
+    document.getElementById('statetxt').textContent =
+      `HP ${player.health}  •  Dad: ${dadState.mode}${player.hiding ? '  •  HIDING' : (keys['ShiftLeft'] ? '  •  sneaking' : '')}`;
+
+    // Bob items
+    for (const it of items) it.mesh.rotation.y += dt * 1.5;
+  }
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+updateInv();
+</script>
+</body>
+</html>
